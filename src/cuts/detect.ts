@@ -8,7 +8,7 @@
 
 export type Word = { text: string; startMs: number; endMs: number };
 
-export type CutReason = "pause" | "repeat";
+export type CutReason = "pause" | "repeat" | "restart";
 
 export type CutRange = { startMs: number; endMs: number; reasons: CutReason[] };
 
@@ -21,6 +21,14 @@ export type DetectOptions = {
   maxRepeatWords?: number;
   /** Copies of a phrase further apart than this are not a restart. */
   maxRepeatGapMs?: number;
+  /**
+   * A run of this many words said again later is a restart: the speaker stumbled and began
+   * the sentence over. Short repeats ("a única coisa que") are idioms, not restarts. 0 turns
+   * restart detection off.
+   */
+  restartSpanWords?: number;
+  /** How many words after the first take the second copy must start. */
+  restartWindowWords?: number;
 };
 
 const DEFAULTS: Required<DetectOptions> = {
@@ -28,6 +36,8 @@ const DEFAULTS: Required<DetectOptions> = {
   pausePaddingMs: 250,
   maxRepeatWords: 6,
   maxRepeatGapMs: 4000,
+  restartSpanWords: 6,
+  restartWindowWords: 30,
 };
 
 const normalize = (text: string): string => text.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
@@ -110,6 +120,45 @@ export function detectRepeats(words: Word[], options: Required<DetectOptions>): 
   return cuts;
 }
 
+/**
+ * Finds a sentence started again. The first take runs from the first word up to the point
+ * where a run of at least `restartSpanWords` words comes back. That whole first take is cut.
+ * Adjacent single-word stutters are handled by detectRepeats; this catches longer restarts
+ * with other words between the two takes.
+ */
+export function detectRestarts(words: Word[], options: Required<DetectOptions>): CutRange[] {
+  if (options.restartSpanWords <= 0) return [];
+
+  const tokens = words.map((word) => normalize(word.text));
+  const cuts: CutRange[] = [];
+
+  let i = 0;
+  while (i < words.length) {
+    let restartAt = -1;
+
+    for (let j = i + 1; j < words.length && j - i <= options.restartWindowWords; j++) {
+      // Length of the run where word i+k matches word j+k, never crossing into the second take.
+      let k = 0;
+      while (i + k < j && j + k < words.length && tokens[i + k] !== "" && tokens[i + k] === tokens[j + k]) {
+        k++;
+      }
+      if (k >= options.restartSpanWords) {
+        restartAt = j;
+        break;
+      }
+    }
+
+    if (restartAt === -1) {
+      i++;
+      continue;
+    }
+
+    cuts.push({ startMs: words[i]!.startMs, endMs: words[restartAt]!.startMs, reasons: ["restart"] });
+    i = restartAt;
+  }
+  return cuts;
+}
+
 /** Joins ranges that touch or overlap, so the editor gets one cut rather than a stack. */
 export function mergeRanges(ranges: CutRange[]): CutRange[] {
   const sorted = [...ranges].sort((a, b) => a.startMs - b.startMs);
@@ -133,5 +182,9 @@ export function detectCuts(words: Word[], options: DetectOptions = {}): CutRange
   validateWords(words);
   const resolved = { ...DEFAULTS, ...options };
 
-  return mergeRanges([...detectRepeats(words, resolved), ...detectPauses(words, resolved)]);
+  return mergeRanges([
+    ...detectRestarts(words, resolved),
+    ...detectRepeats(words, resolved),
+    ...detectPauses(words, resolved),
+  ]);
 }

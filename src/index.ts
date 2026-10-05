@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { renderOverlay } from "./remotion/bridge.js";
 import { prepareSubtitles } from "./workflows/srt.js";
-import { findSpeechCuts, transcribeSpeech } from "./workflows/speech.js";
+import { findSpeechCuts, listAudioTracks, transcribeSpeech } from "./workflows/speech.js";
 
 /**
  * vegas-mcp — independent, unofficial. Not affiliated with MAGIX.
@@ -84,6 +84,7 @@ server.registerTool(
     inputSchema: {
       path: z.string().describe("Absolute path to a video or audio file"),
       outputDir: z.string().optional().describe("Where to write the WAV and JSON; defaults to <package>/out/"),
+      audioTrack: z.number().int().min(0).optional().describe("Audio track to transcribe, 0-based. Run list_audio_tracks first when a file has several. Defaults to 0"),
       model: z.string().optional().describe("Whisper size: tiny, base, small, medium or large-v3. Defaults to small"),
       language: z.string().optional().describe("ISO code such as pt. Omit to detect"),
       verbatim: z.boolean().optional().describe("Keep stutters and fillers. Defaults to true"),
@@ -93,17 +94,32 @@ server.registerTool(
 );
 
 server.registerTool(
+  "list_audio_tracks",
+  {
+    title: "List the audio tracks of a media file",
+    description:
+      "Lists each audio track with its codec, channel count, sample rate, and language or title when present. Use the 0-based index with transcribe_speech's audioTrack. Read-only.",
+    inputSchema: {
+      path: z.string().describe("Absolute path to a video or audio file"),
+    },
+  },
+  async (args) => asToolResult(() => ({ tracks: listAudioTracks(args.path) })),
+);
+
+server.registerTool(
   "find_speech_cuts",
   {
     title: "Find pauses and repeated takes in a transcript",
     description:
-      "Reads a .words.json from transcribe_speech and lists the ranges to cut: silences longer than minPauseMs, and phrases said twice in a row, where the last take is kept. Each cut includes the words it removes, for review. Nothing is edited.",
+      "Reads a .words.json from transcribe_speech and lists the ranges to cut: silences longer than minPauseMs, stutters (a word or phrase said twice in a row, keeping the last take), and restarts (a sentence of restartSpanWords words said again later, cutting the failed first take). Each cut includes the words it removes, for review. Nothing is edited.",
     inputSchema: {
       wordsPath: z.string().describe("Absolute path to a .words.json file"),
       minPauseMs: z.number().optional().describe("Silences at least this long are cut. Defaults to 700"),
       pausePaddingMs: z.number().optional().describe("Breathing room kept at each edge of a cut pause. Defaults to 250"),
-      maxRepeatWords: z.number().optional().describe("Longest repeated phrase, in words. Defaults to 6"),
-      maxRepeatGapMs: z.number().optional().describe("Copies further apart than this are not a restart. Defaults to 4000"),
+      maxRepeatWords: z.number().optional().describe("Longest repeated phrase in a stutter, in words. Defaults to 6"),
+      maxRepeatGapMs: z.number().optional().describe("Stutter copies further apart than this are not repeats. Defaults to 4000"),
+      restartSpanWords: z.number().optional().describe("Words that must come back to count as a restart. Defaults to 6; 0 turns restarts off"),
+      restartWindowWords: z.number().optional().describe("How many words after a take the second copy may start. Defaults to 30"),
     },
   },
   async (args) => asToolResult(() => findSpeechCuts(args)),

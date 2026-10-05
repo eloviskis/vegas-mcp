@@ -63,6 +63,59 @@ describe("detectCuts: repeats", () => {
   });
 });
 
+describe("detectCuts: restarts", () => {
+  // Words 300 ms apart, 200 ms long, so word n starts at n * 300.
+  const seq = (texts: string[]): Word[] => texts.map((text, n) => w(text, n * 300, n * 300 + 200));
+
+  it("cuts a failed first take when a longer run is said again later", () => {
+    const words = seq([
+      "eu", "vou", "ao", "mercado", "comprar", "pão", "hoje",
+      "bem",
+      "eu", "vou", "ao", "mercado", "comprar", "pão", "amanhã",
+    ]);
+    const cuts = detectCuts(words);
+    assert.deepEqual(cuts, [{ startMs: 0, endMs: 2400, reasons: ["restart"] }]);
+  });
+
+  it("ignores a repeated run shorter than restartSpanWords", () => {
+    const words = seq(["a", "única", "coisa", "que", "tem", "x", "y", "a", "única", "coisa", "que", "eu"]);
+    assert.deepEqual(detectCuts(words), []);
+  });
+
+  it("does not look past restartWindowWords for the second take", () => {
+    const words = seq([
+      "eu", "vou", "ao", "mercado", "comprar", "pão", "hoje",
+      "bem",
+      "eu", "vou", "ao", "mercado", "comprar", "pão", "amanhã",
+    ]);
+    assert.deepEqual(detectCuts(words, { restartWindowWords: 3 }), []);
+  });
+
+  it("is off when restartSpanWords is 0", () => {
+    const words = seq([
+      "eu", "vou", "ao", "mercado", "comprar", "pão", "hoje",
+      "bem",
+      "eu", "vou", "ao", "mercado", "comprar", "pão", "amanhã",
+    ]);
+    assert.deepEqual(detectCuts(words, { restartSpanWords: 0 }), []);
+  });
+
+  it("finds the real restart in a transcript with an idiom repeated across sentences", () => {
+    // Mirrors the 60 s clip: "a única coisa que" recurs as an idiom and must not be cut,
+    // while the sentence started again after a stumble must be.
+    const words = seq([
+      "a", "única", "coisa", "que", "tem", "é", "peixe",
+      "e", "hoje", "não", "pode", "fritura", "mercúlio", "tá", "retrógado", "mas", "é", "como", "peixe", "eu", "cara", "sou", "um", "pinguim",
+      "e", "hoje", "não", "pode", "fritura", "mercúlio", "tá", "retrógado", "mas", "eu", "sou", "um", "pinguim",
+      "é", "a", "única", "coisa", "que", "eu", "tenho",
+    ]);
+    const restarts = detectCuts(words).filter((c) => c.reasons.includes("restart"));
+    assert.equal(restarts.length, 1);
+    assert.equal(restarts[0]!.startMs, 7 * 300, "starts at the first 'e hoje'");
+    assert.equal(restarts[0]!.endMs, 24 * 300, "ends where the sentence is said again");
+  });
+});
+
 describe("detectCuts: merging", () => {
   it("merges a pause that sits inside a retake into one cut with both reasons", () => {
     // The pause (550→1250 after padding) lies inside the repeat span (0→1500).

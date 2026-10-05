@@ -5,6 +5,8 @@ import { z } from "zod";
 import { detectCuts, type CutRange, type DetectOptions, type Word } from "../cuts/detect.js";
 import { extractAudio, transcribeWords } from "../transcribe/transcribe.js";
 
+export { listAudioTracks, type AudioTrack } from "../transcribe/transcribe.js";
+
 /**
  * The two speech tools the MCP exposes before the VEGAS bridge exists. Neither one touches
  * a project: they read a media file, write new files to `out/`, and return what they found.
@@ -19,6 +21,8 @@ export type TranscribeSpeechRequest = {
   path: string;
   /** Where the WAV and JSON go. Defaults to `<package>/out/`. */
   outputDir?: string;
+  /** Audio track to transcribe, 0-based among audio tracks. Defaults to 0. See listAudioTracks. */
+  audioTrack?: number;
   model?: string;
   language?: string;
   verbatim?: boolean;
@@ -50,7 +54,7 @@ export function transcribeSpeech(request: TranscribeSpeechRequest): TranscribeSp
   const audioPath = join(outputDir, `${stem}.speech.wav`);
   const wordsPath = join(outputDir, `${stem}.words.json`);
 
-  extractAudio(request.path, audioPath);
+  extractAudio(request.path, audioPath, request.audioTrack ?? 0);
   const result = transcribeWords({
     audioPath,
     model: request.model,

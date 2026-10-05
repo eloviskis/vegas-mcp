@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { extractAudio, normaliseWords, transcribeWords, TranscribeError } from "../src/transcribe/transcribe.js";
+import { extractAudio, normaliseWords, parseAudioTracks, transcribeWords, TranscribeError } from "../src/transcribe/transcribe.js";
 
 describe("normaliseWords", () => {
   it("drops empty tokens and trims text", () => {
@@ -23,6 +23,26 @@ describe("normaliseWords", () => {
   it("gives a zero-length word one millisecond so the detector accepts it", () => {
     const words = normaliseWords([{ text: "oi", startMs: 1000, endMs: 1000 }]);
     assert.deepEqual(words[0], { text: "oi", startMs: 1000, endMs: 1001 });
+  });
+});
+
+describe("parseAudioTracks", () => {
+  it("numbers audio tracks from 0 and keeps codec, channels and language", () => {
+    const tracks = parseAudioTracks({
+      streams: [
+        { codec_name: "aac", channels: 2, sample_rate: "48000", tags: { language: "por" } },
+        { codec_name: "unknown", channels: 4, sample_rate: "48000", tags: { title: "Multicanal" } },
+      ],
+    });
+    assert.deepEqual(tracks, [
+      { index: 0, codec: "aac", channels: 2, sampleRate: 48000, language: "por" },
+      { index: 1, codec: "unknown", channels: 4, sampleRate: 48000, title: "Multicanal" },
+    ]);
+  });
+
+  it("returns no tracks for a file without audio", () => {
+    assert.deepEqual(parseAudioTracks({ streams: [] }), []);
+    assert.deepEqual(parseAudioTracks({}), []);
   });
 });
 

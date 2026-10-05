@@ -98,23 +98,83 @@ export function normaliseWords(raw: Array<{ text: string; startMs: number; endMs
   return words;
 }
 
-export function extractAudio(inputPath: string, wavPath: string): void {
+export type AudioTrack = {
+  /** Position among the audio streams only, 0-based. This is what `audioTrack` takes. */
+  index: number;
+  codec: string;
+  channels: number;
+  sampleRate: number;
+  language?: string;
+  title?: string;
+};
+
+/**
+ * Turns ffprobe's JSON into the audio tracks. Pure, so it is testable without ffprobe. Files
+ * with several tracks (a stereo mix plus a multichannel one, say) must be checked, not
+ * guessed: the default choice is the first track.
+ */
+export function parseAudioTracks(json: unknown): AudioTrack[] {
+  const streams = (json as { streams?: unknown[] } | null)?.streams ?? [];
+  return streams.map((raw, index) => {
+    const s = raw as {
+      codec_name?: string;
+      channels?: number;
+      sample_rate?: string;
+      tags?: { language?: string; title?: string };
+    };
+    return {
+      index,
+      codec: s.codec_name ?? "unknown",
+      channels: s.channels ?? 0,
+      sampleRate: Number(s.sample_rate ?? 0),
+      ...(s.tags?.language ? { language: s.tags.language } : {}),
+      ...(s.tags?.title ? { title: s.tags.title } : {}),
+    };
+  });
+}
+
+export function listAudioTracks(inputPath: string): AudioTrack[] {
+  if (!existsSync(inputPath)) {
+    throw new TranscribeError(`Media file not found: ${inputPath}`);
+  }
+  const result = spawnSync(
+    "ffprobe",
+    ["-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name,channels,sample_rate:stream_tags=language,title", "-of", "json", inputPath],
+    { encoding: "utf-8", timeout: 60_000 },
+  );
+  if (result.error) {
+    throw new TranscribeError(`ffprobe could not start: ${result.error.message}. Is it on PATH?`);
+  }
+  if (result.status !== 0) {
+    throw new TranscribeError(`ffprobe failed: ${(result.stderr || "no output").trim().slice(0, 600)}`);
+  }
+  return parseAudioTracks(JSON.parse(result.stdout));
+}
+
+export function extractAudio(inputPath: string, wavPath: string, audioTrack = 0): void {
   if (!existsSync(inputPath)) {
     throw new TranscribeError(`Media file not found: ${inputPath}`);
   }
   mkdirSync(dirname(wavPath), { recursive: true });
 
   // 16 kHz mono PCM is what Whisper resamples to anyway; giving it that directly skips work.
+  // `0:a:N` picks the Nth audio stream explicitly, so the choice never depends on ffmpeg's defaults.
   const result = spawnSync(
     "ffmpeg",
-    ["-y", "-v", "error", "-i", inputPath, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wavPath],
+    ["-y", "-v", "error", "-i", inputPath, "-map", `0:a:${audioTrack}`, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wavPath],
     { encoding: "utf-8", timeout: 10 * 60_000 },
   );
   if (result.error) {
     throw new TranscribeError(`ffmpeg could not start: ${result.error.message}. Is it on PATH?`);
   }
   if (result.status !== 0) {
-    throw new TranscribeError(`ffmpeg failed: ${(result.stderr || "no output").trim().slice(0, 600)}`);
+    const stderr = (result.stderr || "no output").trim();
+    if (/no decoder found/i.test(stderr)) {
+      throw new TranscribeError(
+        `Audio track ${audioTrack} cannot be decoded by ffmpeg (no decoder). It is probably a data or unsupported track, not sound. Run list_audio_tracks and pick a track with a real codec.`,
+      );
+    }
+    throw new TranscribeError(`ffmpeg failed: ${stderr.slice(0, 600)}`);
   }
 }
 
