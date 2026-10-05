@@ -8,7 +8,8 @@
 
 export type Word = { text: string; startMs: number; endMs: number };
 
-export type CutReason = "pause" | "repeat" | "restart";
+/** Why a range is cut. "pause" is a gap between words; "silence" is measured in the audio itself. */
+export type CutReason = "pause" | "repeat" | "restart" | "silence";
 
 export type CutRange = { startMs: number; endMs: number; reasons: CutReason[] };
 

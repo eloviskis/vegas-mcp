@@ -1,6 +1,7 @@
 import React from "react";
 import { Composition } from "remotion";
 import { Overlay, OVERLAY_DEFAULTS, type OverlayProps } from "./Overlay";
+import { Captions, CAPTIONS_DEFAULTS, type CaptionsProps } from "./Captions";
 
 /**
  * One composition, driven entirely by props passed at render time (`--props`), so the
@@ -9,6 +10,7 @@ import { Overlay, OVERLAY_DEFAULTS, type OverlayProps } from "./Overlay";
  * Dimensions and duration are overridden per render with `--width/--height/--frames`.
  */
 export const RemotionRoot: React.FC = () => (
+  <>
   <Composition
     id="Overlay"
     component={Overlay}
@@ -24,4 +26,17 @@ export const RemotionRoot: React.FC = () => (
       durationInFrames: props.durationInFrames ?? 90,
     })}
   />
+  <Composition
+    id="Captions"
+    component={Captions}
+    durationInFrames={90}
+    fps={30}
+    width={1080}
+    height={1920}
+    defaultProps={CAPTIONS_DEFAULTS satisfies CaptionsProps}
+    calculateMetadata={({ props }) => ({
+      durationInFrames: props.durationInFrames ?? 90,
+    })}
+  />
+  </>
 );

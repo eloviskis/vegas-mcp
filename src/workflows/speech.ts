@@ -2,7 +2,8 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { detectCuts, type CutRange, type DetectOptions, type Word } from "../cuts/detect.js";
+import { detectCuts, mergeRanges, type CutRange, type DetectOptions, type Word } from "../cuts/detect.js";
+import { detectSilences, silenceToCuts } from "../cuts/silence.js";
 import { extractAudio, transcribeWords } from "../transcribe/transcribe.js";
 
 export { listAudioTracks, type AudioTrack } from "../transcribe/transcribe.js";
@@ -79,7 +80,32 @@ export function transcribeSpeech(request: TranscribeSpeechRequest): TranscribeSp
   };
 }
 
-export type FindSpeechCutsRequest = DetectOptions & { wordsPath: string };
+/** The words in a .words.json, validated. Captions and cut detection both start here. */
+export function readWords(wordsPath: string): Word[] {
+  if (!existsSync(wordsPath)) {
+    throw new Error(`Words file not found: ${wordsPath}`);
+  }
+  const parsed = wordsFileSchema.safeParse(JSON.parse(readFileSync(wordsPath, "utf-8")));
+  if (!parsed.success) {
+    throw new Error(`Words file has an unexpected shape: ${parsed.error.issues[0]?.message ?? "invalid"}`);
+  }
+  return parsed.data.words;
+}
+
+/** The media file a .words.json was made from, so a plan can check it matches the clip. */
+export function readWordsSource(wordsPath: string): string | undefined {
+  if (!existsSync(wordsPath)) {
+    throw new Error(`Words file not found: ${wordsPath}`);
+  }
+  const parsed = wordsFileSchema.safeParse(JSON.parse(readFileSync(wordsPath, "utf-8")));
+  return parsed.success ? parsed.data.source : undefined;
+}
+
+export type FindSpeechCutsRequest = DetectOptions & {
+  wordsPath: string;
+  /** The WAV transcribe_speech extracted. When given, silences measured in the audio are cut too. */
+  audioPath?: string;
+};
 
 export type SpeechCut = CutRange & {
   durationMs: number;
@@ -120,9 +146,18 @@ export function findSpeechCuts(request: FindSpeechCutsRequest): FindSpeechCutsRe
     throw new Error(`Words file has an unexpected shape at "${where}": ${issue?.message ?? "invalid"}`);
   }
 
-  const { wordsPath: _ignored, ...options } = request;
+  const { wordsPath: _ignored, audioPath, ...options } = request;
   const words = parsed.data.words;
-  const ranges = detectCuts(words, options);
+  const wordCuts = detectCuts(words, options);
+
+  // Silences from the audio catch breaths and room tone that the transcript skips over.
+  const silenceCuts = audioPath
+    ? silenceToCuts(detectSilences(audioPath), {
+        pausePaddingMs: options.pausePaddingMs ?? 250,
+        minPauseMs: options.minPauseMs ?? 700,
+      })
+    : [];
+  const ranges = mergeRanges([...wordCuts, ...silenceCuts]);
 
   const cuts: SpeechCut[] = ranges.map((range) => ({
     ...range,

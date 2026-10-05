@@ -1,0 +1,585 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+using ScriptPortal.Vegas;
+
+/*
+ * vegas-mcp bridge. Runs inside VEGAS (Tools > Scripting) and listens on 127.0.0.1 for
+ * one-line commands from the MCP server:
+ *
+ *     <token> status
+ *     <token> timeline
+ *     <token> split <trackIndex> <eventIndex> <offsetMs>
+ *     <token> remove <startMs> <endMs>
+ *     <token> stop
+ *
+ * The token is random per run and written to %APPDATA%\vegas-mcp\bridge-token.txt. Every
+ * reply is one JSON line.
+ *
+ * Threading: VEGAS objects are COM and belong to the thread that runs the script. The
+ * listener therefore never touches VEGAS. It queues each request, and a WinForms timer on
+ * the script's own thread drains the queue. FromVegas returns straight away, so VEGAS stays
+ * usable while the bridge runs.
+ *
+ * Only `split` and `remove` change the project. Each runs inside an UndoBlock, so Ctrl+Z
+ * reverts it.
+ */
+public class EntryPoint
+{
+    private const int Port = 47802;
+    private const int ReplyTimeoutMs = 20000;
+    private const int RenderTimeoutMs = 30 * 60 * 1000;
+
+    // Static so the garbage collector cannot drop the listener, the timer or the VEGAS reference.
+    private static TcpListener listener;
+    private static System.Windows.Forms.Timer pumpTimer;
+    private static Vegas vegasRef;
+    private static string token;
+    private static string statusPath;
+    private static volatile bool running;
+
+    private static readonly object queueLock = new object();
+    private static readonly Queue<PendingRequest> pending = new Queue<PendingRequest>();
+
+    private class PendingRequest
+    {
+        public string Line;
+        public string Reply;
+        public readonly ManualResetEvent Done = new ManualResetEvent(false);
+    }
+
+    public void FromVegas(Vegas vegas)
+    {
+        vegasRef = vegas;
+        statusPath = Path.Combine(Path.GetTempPath(), "vegas-mcp-bridge-status.json");
+        try
+        {
+            token = NewToken();
+            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "vegas-mcp");
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "bridge-token.txt"), token, new UTF8Encoding(false));
+
+            listener = new TcpListener(IPAddress.Loopback, Port);
+            listener.Start();
+            running = true;
+
+            pumpTimer = new System.Windows.Forms.Timer();
+            pumpTimer.Interval = 25;
+            pumpTimer.Tick += delegate { Pump(); };
+            pumpTimer.Start();
+
+            new Thread(new ThreadStart(AcceptLoop)) { IsBackground = true, Name = "vegas-mcp-bridge" }.Start();
+
+            WriteStatus("running", "listening on 127.0.0.1:" + Port + "; send 'stop' to end");
+        }
+        catch (Exception error)
+        {
+            WriteStatus("failed", error.GetType().Name + ": " + error.Message);
+        }
+    }
+
+    /** Runs on a background thread. Reads one request per client and waits for VEGAS to answer. */
+    private static void AcceptLoop()
+    {
+        while (running)
+        {
+            TcpClient client;
+            try
+            {
+                client = listener.AcceptTcpClient();
+            }
+            catch (Exception)
+            {
+                return; // listener stopped
+            }
+
+            try
+            {
+                using (client)
+                using (var stream = client.GetStream())
+                using (var reader = new StreamReader(stream, Encoding.UTF8))
+                using (var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true })
+                {
+                    var line = reader.ReadLine() ?? "";
+                    writer.WriteLine(Dispatch(line));
+                }
+            }
+            catch (Exception error)
+            {
+                WriteStatus("client-error", error.Message);
+            }
+        }
+    }
+
+    /** Queues one request for the VEGAS thread and waits for its reply. */
+    private static string Dispatch(string line)
+    {
+        var request = new PendingRequest { Line = line };
+        lock (queueLock)
+        {
+            pending.Enqueue(request);
+        }
+        // Rendering runs on VEGAS's thread and can take minutes; other commands answer quickly.
+        var timeoutMs = line.IndexOf(" render ", StringComparison.Ordinal) >= 0 ? RenderTimeoutMs : ReplyTimeoutMs;
+        if (!request.Done.WaitOne(timeoutMs))
+        {
+            return Error("VEGAS did not answer within " + (timeoutMs / 1000) + " s");
+        }
+        return request.Reply;
+    }
+
+    /** Runs on the script's own thread, on the timer tick. Only here is it safe to touch VEGAS. */
+    private static void Pump()
+    {
+        try
+        {
+            var batch = new List<PendingRequest>();
+            lock (queueLock)
+            {
+                while (pending.Count > 0) batch.Add(pending.Dequeue());
+            }
+
+            foreach (var request in batch)
+            {
+                request.Reply = Handle(request.Line);
+                request.Done.Set();
+            }
+
+            if (!running)
+            {
+                pumpTimer.Stop();
+                listener.Stop();
+                WriteStatus("stopped", "stop received");
+            }
+        }
+        catch (Exception error)
+        {
+            WriteStatus("pump-error", error.GetType().Name + ": " + error.Message);
+        }
+    }
+
+    /** Parses one request line and returns one JSON reply line. */
+    private static string Handle(string line)
+    {
+        var parts = line.Trim().Split(' ');
+        if (parts.Length < 2 || parts[0] != token)
+        {
+            return Error("unauthorized");
+        }
+
+        try
+        {
+            switch (parts[1])
+            {
+                case "status":
+                    return Status();
+                case "timeline":
+                    return Timeline();
+                case "split":
+                    if (parts.Length != 5) return Error("usage: split <trackIndex> <eventIndex> <offsetMs>");
+                    return Split(int.Parse(parts[2], CultureInfo.InvariantCulture),
+                                 int.Parse(parts[3], CultureInfo.InvariantCulture),
+                                 double.Parse(parts[4], CultureInfo.InvariantCulture));
+                case "remove":
+                    if (parts.Length != 4) return Error("usage: remove <startMs> <endMs>");
+                    return RemoveRange(double.Parse(parts[2], CultureInfo.InvariantCulture),
+                                       double.Parse(parts[3], CultureInfo.InvariantCulture));
+                case "backup":
+                    return Backup();
+                case "overlay":
+                    return Overlay(ArgsAfter(line, 2));
+                case "alpha":
+                    if (parts.Length != 3) return Error("usage: alpha <trackIndex>");
+                    return Alpha(parts[2]);
+                case "render_templates":
+                    return RenderTemplates();
+                case "render":
+                    return Render(ArgsAfter(line, 2));
+                case "stop":
+                    running = false;
+                    return "{\"ok\": true, \"stopping\": true}";
+                default:
+                    return Error("unknown command: " + parts[1]);
+            }
+        }
+        catch (Exception error)
+        {
+            return Error(error.GetType().Name + ": " + error.Message);
+        }
+    }
+
+    private static string Status()
+    {
+        var tracks = 0;
+        foreach (Track t in vegasRef.Project.Tracks) tracks++;
+        return "{\"ok\": true, \"tracks\": " + tracks
+            + ", \"projectLengthMs\": " + Num(vegasRef.Project.Length.ToMilliseconds())
+            + ", \"projectPath\": " + Quote(vegasRef.Project.FilePath)
+            + ", \"projectModified\": " + (vegasRef.Project.IsModified ? "true" : "false") + "}";
+    }
+
+    /** Returns the text of a request line after its first `words` space-separated words. Keeps spaces in paths. */
+    private static string ArgsAfter(string line, int words)
+    {
+        var rest = line.Trim();
+        for (int i = 0; i < words; i++)
+        {
+            int space = rest.IndexOf(' ');
+            rest = space < 0 ? "" : rest.Substring(space + 1);
+        }
+        return rest.Trim();
+    }
+
+    /**
+     * Adds a new video track at the top and places a clip on it. Arguments: <path>|<startMs>|<lengthMs>.
+     * The clip uses its first video stream. Overlays with alpha, such as render_overlay output, show
+     * over the footage below.
+     */
+    private static string Overlay(string args)
+    {
+        var parts = args.Split('|');
+        if (parts.Length != 3)
+        {
+            return Error("usage: overlay <path>|<startMs>|<lengthMs>");
+        }
+        var path = parts[0];
+        var startMs = double.Parse(parts[1], CultureInfo.InvariantCulture);
+        var lengthMs = double.Parse(parts[2], CultureInfo.InvariantCulture);
+        if (!File.Exists(path))
+        {
+            return Error("media not found: " + path);
+        }
+        if (!(lengthMs > 0))
+        {
+            return Error("lengthMs must be positive");
+        }
+
+        using (new UndoBlock(vegasRef.Project, "vegas-mcp overlay"))
+        {
+            var media = new Media(path);
+            if (!media.HasVideo())
+            {
+                return Error("the file has no video stream to place as an overlay");
+            }
+            // Without straight alpha and source-alpha compositing, VEGAS shows the transparent
+            // pixels as opaque black and hides the footage underneath.
+            var stream = media.GetVideoStreamByIndex(0);
+            stream.AlphaChannel = VideoAlphaType.Straight;
+            var track = vegasRef.Project.AddVideoTrack();
+            track.CompositeMode = CompositeMode.SrcAlpha;
+            var ev = track.AddVideoEvent(new Timecode(startMs), new Timecode(lengthMs));
+            ev.AddTake(stream);
+        }
+        return "{\"ok\": true, \"placedMs\": " + Num(startMs) + ", \"lengthMs\": " + Num(lengthMs) + "}";
+    }
+
+    /**
+     * Fixes an existing overlay track: composites its clips by source alpha and marks each clip's
+     * media as straight alpha. Use it on tracks made before overlay set these itself.
+     */
+    private static string Alpha(string indexText)
+    {
+        int trackIndex = int.Parse(indexText, CultureInfo.InvariantCulture);
+        var track = vegasRef.Project.Tracks[trackIndex] as VideoTrack;
+        if (track == null)
+        {
+            return Error("track " + trackIndex + " is not a video track");
+        }
+
+        int marked = 0;
+        using (new UndoBlock(vegasRef.Project, "vegas-mcp alpha"))
+        {
+            track.CompositeMode = CompositeMode.SrcAlpha;
+            foreach (TrackEvent ev in new List<TrackEvent>(track.Events))
+            {
+                var take = ev.ActiveTake;
+                if (take == null || take.Media == null) continue;
+                take.Media.GetVideoStreamByIndex(0).AlphaChannel = VideoAlphaType.Straight;
+                marked++;
+            }
+        }
+        return "{\"ok\": true, \"track\": " + trackIndex + ", \"clipsMarked\": " + marked + "}";
+    }
+
+    /** Lists every render template as "Renderer :: Template", the form render expects. */
+    private static string RenderTemplates()
+    {
+        var sb = new StringBuilder();
+        sb.Append("{\"ok\": true, \"templates\": [");
+        bool first = true;
+        foreach (Renderer renderer in vegasRef.Renderers)
+        {
+            foreach (RenderTemplate template in renderer.Templates)
+            {
+                if (!first) sb.Append(", ");
+                first = false;
+                sb.Append(Quote(renderer.Name + " :: " + template.Name));
+            }
+        }
+        sb.Append("]}");
+        return sb.ToString();
+    }
+
+    /**
+     * Renders the whole project. Arguments: <Renderer :: Template>|<outputPath>. Never overwrites
+     * an existing file. The render runs on VEGAS's thread, so the bridge does not answer until
+     * it finishes.
+     */
+    private static string Render(string args)
+    {
+        var parts = args.Split('|');
+        if (parts.Length != 2)
+        {
+            return Error("usage: render <Renderer :: Template>|<outputPath>");
+        }
+        var names = parts[0].Split(new[] { " :: " }, StringSplitOptions.None);
+        if (names.Length != 2)
+        {
+            return Error("use the 'Renderer :: Template' name from render_templates");
+        }
+        var outputPath = parts[1];
+        if (File.Exists(outputPath))
+        {
+            return Error("output already exists; choose another path: " + outputPath);
+        }
+
+        RenderTemplate chosen = null;
+        foreach (Renderer renderer in vegasRef.Renderers)
+        {
+            if (renderer.Name != names[0]) continue;
+            foreach (RenderTemplate template in renderer.Templates)
+            {
+                if (template.Name == names[1]) { chosen = template; break; }
+            }
+            if (chosen != null) break;
+        }
+        if (chosen == null)
+        {
+            return Error("render template not found: " + parts[0]);
+        }
+
+        var dir = Path.GetDirectoryName(outputPath);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+        vegasRef.Project.Render(outputPath, chosen);
+        return "{\"ok\": true, \"outputPath\": " + Quote(outputPath) + ", \"written\": " + (File.Exists(outputPath) ? "true" : "false") + "}";
+    }
+
+    /**
+     * Copies the project file as it is on disk into %APPDATA%\vegas-mcp\backups. Changes that
+     * are not saved yet are not in that copy; the reply says so when the project is modified.
+     */
+    private static string Backup()
+    {
+        var source = vegasRef.Project.FilePath;
+        if (string.IsNullOrEmpty(source) || !File.Exists(source))
+        {
+            return Error("the project has not been saved to a file yet; save it once in VEGAS, then try again");
+        }
+
+        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "vegas-mcp", "backups");
+        Directory.CreateDirectory(dir);
+        var name = Path.GetFileNameWithoutExtension(source) + "-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + Path.GetExtension(source);
+        var destination = Path.Combine(dir, name);
+        File.Copy(source, destination, false);
+
+        return "{\"ok\": true, \"backupPath\": " + Quote(destination)
+            + ", \"projectModified\": " + (vegasRef.Project.IsModified ? "true" : "false") + "}";
+    }
+
+    private static string Timeline()
+    {
+        var sb = new StringBuilder();
+        sb.Append("{\"ok\": true, \"tracks\": [");
+        int trackIndex = 0;
+        foreach (Track track in vegasRef.Project.Tracks)
+        {
+            if (trackIndex > 0) sb.Append(", ");
+            sb.Append("{\"index\": " + trackIndex + ", \"type\": " + Quote(track is VideoTrack ? "video" : track is AudioTrack ? "audio" : "other") + ", \"events\": [");
+            int eventIndex = 0;
+            foreach (TrackEvent ev in track.Events)
+            {
+                if (eventIndex > 0) sb.Append(", ");
+                // The take's offset is the media time that plays at the event's start. Speech
+                // timestamps are media time, so this is what maps them onto the timeline.
+                var take = ev.ActiveTake;
+                sb.Append("{\"index\": " + eventIndex
+                    + ", \"startMs\": " + Num(ev.Start.ToMilliseconds())
+                    + ", \"lengthMs\": " + Num(ev.Length.ToMilliseconds())
+                    + ", \"grouped\": " + (ev.IsGrouped ? "true" : "false")
+                    + ", \"takeOffsetMs\": " + (take == null ? "0.0" : Num(take.Offset.ToMilliseconds()))
+                    + ", \"mediaPath\": " + Quote(take == null ? null : take.MediaPath) + "}");
+                eventIndex++;
+            }
+            sb.Append("]}");
+            trackIndex++;
+        }
+        sb.Append("]}");
+        return sb.ToString();
+    }
+
+    /**
+     * Splits the event at trackIndex/eventIndex, offsetMs into it. A grouped event (video
+     * plus audio) is split member by member, so both sides stay cut together.
+     */
+    private static string Split(int trackIndex, int eventIndex, double offsetMs)
+    {
+        var track = vegasRef.Project.Tracks[trackIndex];
+        var ev = track.Events[eventIndex];
+        var offset = new Timecode(offsetMs);
+
+        if (offset.ToMilliseconds() <= 0 || offset.ToMilliseconds() >= ev.Length.ToMilliseconds())
+        {
+            return Error("offset must fall inside the event");
+        }
+
+        int splits;
+        using (new UndoBlock(vegasRef.Project, "vegas-mcp split"))
+        {
+            splits = SplitEventAt(ev, ev.Start.ToMilliseconds() + offset.ToMilliseconds());
+        }
+        return "{\"ok\": true, \"splits\": " + splits + "}";
+    }
+
+    /**
+     * Removes [startMs, endMs) from every track and closes the gap. Both edges are split first,
+     * on every track, so the removed pieces line up exactly. Events after the gap move left by
+     * its length, on every track, so video and audio stay in step.
+     */
+    private static string RemoveRange(double startMs, double endMs)
+    {
+        if (!(startMs >= 0) || !(endMs > startMs))
+        {
+            return Error("range must satisfy 0 <= startMs < endMs");
+        }
+        double gap = endMs - startMs;
+        int removed = 0;
+        int shifted = 0;
+
+        using (new UndoBlock(vegasRef.Project, "vegas-mcp remove range"))
+        {
+            SplitAt(startMs);
+            SplitAt(endMs);
+
+            foreach (Track track in vegasRef.Project.Tracks)
+            {
+                foreach (TrackEvent ev in new List<TrackEvent>(track.Events))
+                {
+                    double evStart = ev.Start.ToMilliseconds();
+                    if (evStart >= startMs - 0.5 && evStart + ev.Length.ToMilliseconds() <= endMs + 0.5)
+                    {
+                        track.Events.Remove(ev);
+                        removed++;
+                    }
+                }
+            }
+
+            foreach (Track track in vegasRef.Project.Tracks)
+            {
+                foreach (TrackEvent ev in new List<TrackEvent>(track.Events))
+                {
+                    double evStart = ev.Start.ToMilliseconds();
+                    if (evStart >= endMs - 0.5)
+                    {
+                        ev.Start = new Timecode(evStart - gap);
+                        shifted++;
+                    }
+                }
+            }
+        }
+        return "{\"ok\": true, \"removedMs\": " + Num(gap) + ", \"removedEvents\": " + removed + ", \"shiftedEvents\": " + shifted + "}";
+    }
+
+    /**
+     * Splits every event that strictly contains timelineMs, on every track. Grouped events split
+     * together. Each split is checked against the current position of the event, so a piece that
+     * already starts or ends at timelineMs is left alone.
+     */
+    private static void SplitAt(double timelineMs)
+    {
+        foreach (Track track in vegasRef.Project.Tracks)
+        {
+            foreach (TrackEvent ev in new List<TrackEvent>(track.Events))
+            {
+                if (Contains(ev, timelineMs))
+                {
+                    SplitEventAt(ev, timelineMs);
+                }
+            }
+        }
+    }
+
+    /**
+     * Splits one event at a timeline position. A group holds every piece of the original clip,
+     * not only the one being cut, so each member is split only if it contains the position itself.
+     */
+    private static int SplitEventAt(TrackEvent ev, double timelineMs)
+    {
+        int splits = 0;
+        if (ev.IsGrouped)
+        {
+            var members = new List<TrackEvent>();
+            int groupSize = ev.Group.Count;
+            for (int i = 0; i < groupSize; i++)
+            {
+                members.Add(ev.Group[i]);
+            }
+            foreach (TrackEvent member in members)
+            {
+                if (Contains(member, timelineMs))
+                {
+                    member.Split(new Timecode(timelineMs - member.Start.ToMilliseconds()));
+                    splits++;
+                }
+            }
+        }
+        else
+        {
+            ev.Split(new Timecode(timelineMs - ev.Start.ToMilliseconds()));
+            splits = 1;
+        }
+        return splits;
+    }
+
+    /** True when the event strictly contains the position, with half a millisecond of slack at the edges. */
+    private static bool Contains(TrackEvent ev, double timelineMs)
+    {
+        double start = ev.Start.ToMilliseconds();
+        return timelineMs > start + 0.5 && timelineMs < start + ev.Length.ToMilliseconds() - 0.5;
+    }
+
+    private static string NewToken()
+    {
+        var bytes = new byte[24];
+        using (var rng = new RNGCryptoServiceProvider()) rng.GetBytes(bytes);
+        return Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+    }
+
+    private static string Error(string message)
+    {
+        return "{\"ok\": false, \"error\": " + Quote(message) + "}";
+    }
+
+    private static string Num(double value)
+    {
+        return value.ToString("F1", CultureInfo.InvariantCulture);
+    }
+
+    private static string Quote(string value)
+    {
+        if (value == null) return "null";
+        return "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " ") + "\"";
+    }
+
+    private static void WriteStatus(string state, string detail)
+    {
+        var json = "{\"state\": " + Quote(state) + ", \"detail\": " + Quote(detail) + "}\n";
+        File.WriteAllText(statusPath, json, new UTF8Encoding(false));
+    }
+}
