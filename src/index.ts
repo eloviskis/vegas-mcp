@@ -49,7 +49,7 @@ server.registerTool(
   {
     title: "Render a transparent motion-graphics overlay",
     description:
-      "Renders an animated overlay with a real alpha channel (ProRes 4444, yuva444p10le) using Remotion. Returns the .mov path to import into VEGAS Pro and place on a track above the footage. Requires ffmpeg. Rendering takes tens of seconds.",
+      "Renders an animated overlay with a real alpha channel (ProRes 4444, yuva444p12le) using Remotion. Returns the .mov path to import into VEGAS Pro and place on a track above the footage. Requires ffmpeg. Rendering takes tens of seconds.",
     inputSchema: {
       ...overlayShape,
       outputPath: z.string().optional().describe("Absolute .mov path; defaults to <package>/out/"),
