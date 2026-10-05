@@ -28,8 +28,8 @@ using ScriptPortal.Vegas;
  * the script's own thread drains the queue. FromVegas returns straight away, so VEGAS stays
  * usable while the bridge runs.
  *
- * Only `split` and `remove` change the project. Each runs inside an UndoBlock, so Ctrl+Z
- * reverts it.
+ * Every command that changes the project runs inside an UndoBlock, so Ctrl+Z reverts it.
+ * `undo` calls Project.Undo for test runs; the MCP server does not expose it.
  */
 public class EntryPoint
 {
@@ -61,13 +61,15 @@ public class EntryPoint
         statusPath = Path.Combine(Path.GetTempPath(), "vegas-mcp-bridge-status.json");
         try
         {
+            // Open the port first. If another instance already holds it, this fails before the
+            // token file is touched, so the instance that is running keeps working.
+            listener = new TcpListener(IPAddress.Loopback, Port);
+            listener.Start();
+
             token = NewToken();
             var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "vegas-mcp");
             Directory.CreateDirectory(dir);
             File.WriteAllText(Path.Combine(dir, "bridge-token.txt"), token, new UTF8Encoding(false));
-
-            listener = new TcpListener(IPAddress.Loopback, Port);
-            listener.Start();
             running = true;
 
             pumpTimer = new System.Windows.Forms.Timer();
@@ -206,10 +208,18 @@ public class EntryPoint
                     return SetFades(ArgsAfter(line, 2));
                 case "normalize":
                     return SetNormalize(ArgsAfter(line, 2));
+                case "speed":
+                    return SetSpeed(ArgsAfter(line, 2));
+                case "motion_info":
+                    return MotionInfo(ArgsAfter(line, 2));
+                case "motion_fill":
+                    return SetScaleToFill(ArgsAfter(line, 2));
                 case "render_templates":
                     return RenderTemplates();
                 case "render":
                     return Render(ArgsAfter(line, 2));
+                case "undo":
+                    return Undo();
                 case "stop":
                     running = false;
                     return "{\"ok\": true, \"stopping\": true}";
@@ -402,6 +412,207 @@ public class EntryPoint
             }
         }
         return AudioInfo(trackIndex, eventIndex);
+    }
+
+    /**
+     * The events that play the same stretch of the same clip. A group holds every piece of the
+     * original clip, so only members that start where this event starts belong to it: its video
+     * or audio counterpart.
+     */
+    private static List<TrackEvent> SameStartMembers(TrackEvent ev)
+    {
+        var members = new List<TrackEvent>();
+        double start = ev.Start.ToMilliseconds();
+        if (!ev.IsGrouped)
+        {
+            members.Add(ev);
+            return members;
+        }
+        int groupSize = ev.Group.Count;
+        for (int i = 0; i < groupSize; i++)
+        {
+            var member = ev.Group[i];
+            if (Math.Abs(member.Start.ToMilliseconds() - start) < 1.0)
+            {
+                members.Add(member);
+            }
+        }
+        if (members.Count == 0)
+        {
+            members.Add(ev);
+        }
+        return members;
+    }
+
+    /** True when an event plays the given media file. Used so a speed change only touches its own clip. */
+    private static bool SameSource(TrackEvent ev, string source)
+    {
+        var take = ev.ActiveTake;
+        return take != null && source != null && string.Equals(take.MediaPath, source, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /**
+     * Speeds up a clip and its audio counterpart, and shortens it on the timeline.
+     * Arguments: <track>|<event>|<rate>, with rate 1 to 10. Rate 2 plays twice as fast and halves
+     * the clip. The clip is cut at its new end, the cut-off tail of the same media is removed, and
+     * the events after the clip move back to close the gap. Then the head is sped up through
+     * AdjustPlaybackRate, which keeps the head's length and stretches the media it plays. The whole
+     * change is one undo step, so Ctrl+Z reverts all of it.
+     *
+     * Measured on VEGAS 2026.0.3 (189): setting PlaybackRate on its own rendered black and silent,
+     * and AdjustPlaybackRate keeps the event's length, so it has to be applied to a clip that is
+     * already cut to its new length. Hence the cut comes first.
+     */
+    private static string SetSpeed(string args)
+    {
+        var p = args.Split('|');
+        if (p.Length != 3)
+        {
+            return Error("usage: speed <trackIndex>|<eventIndex>|<rate>");
+        }
+        var ev = FindEvent(int.Parse(p[0], CultureInfo.InvariantCulture), int.Parse(p[1], CultureInfo.InvariantCulture));
+        var rate = double.Parse(p[2], CultureInfo.InvariantCulture);
+        if (!(rate >= 1 && rate <= 10))
+        {
+            return Error("speed-up rates are 1 to 10; undo a speed change with Ctrl+Z in VEGAS");
+        }
+        if (Math.Abs(ev.PlaybackRate - 1.0) > 0.001)
+        {
+            return Error("this clip already has a speed change; undo it with Ctrl+Z in VEGAS first");
+        }
+
+        double start = ev.Start.ToMilliseconds();
+        double oldEnd = start + ev.Length.ToMilliseconds();
+        double cutAt = start + (oldEnd - start) / rate;
+        double delta = oldEnd - cutAt;
+        string source = ev.ActiveTake != null ? ev.ActiveTake.MediaPath : null;
+        int splits = 0;
+        int removed = 0;
+        int changed = 0;
+        int moved = 0;
+        double newLength = 0;
+        double takeOffset = 0;
+
+        using (new UndoBlock(vegasRef.Project, "vegas-mcp speed"))
+        {
+            // Only this clip's own pieces are cut, so other tracks keep their cuts.
+            foreach (TrackEvent member in SameStartMembers(ev))
+            {
+                if (Contains(member, cutAt))
+                {
+                    member.Split(new Timecode(cutAt - member.Start.ToMilliseconds()));
+                    splits++;
+                }
+            }
+
+            foreach (Track track in vegasRef.Project.Tracks)
+            {
+                foreach (TrackEvent other in new List<TrackEvent>(track.Events))
+                {
+                    double s = other.Start.ToMilliseconds();
+                    if (other.IsGrouped && s >= cutAt - 0.5 && s < oldEnd - 0.5 && SameSource(other, source))
+                    {
+                        track.Events.Remove(other);
+                        removed++;
+                    }
+                }
+            }
+
+            foreach (TrackEvent member in SameStartMembers(ev))
+            {
+                member.AdjustPlaybackRate(rate, false);
+                changed++;
+            }
+
+            foreach (Track track in vegasRef.Project.Tracks)
+            {
+                foreach (TrackEvent other in new List<TrackEvent>(track.Events))
+                {
+                    if (other.Start.ToMilliseconds() >= oldEnd - 0.5)
+                    {
+                        other.Start = new Timecode(other.Start.ToMilliseconds() - delta);
+                        moved++;
+                    }
+                }
+            }
+
+            newLength = ev.Length.ToMilliseconds();
+            takeOffset = ev.ActiveTake != null ? ev.ActiveTake.Offset.ToMilliseconds() : 0;
+        }
+        return "{\"ok\": true, \"rate\": " + rate.ToString("F3", CultureInfo.InvariantCulture)
+            + ", \"splits\": " + splits
+            + ", \"tailPiecesRemoved\": " + removed
+            + ", \"eventsChanged\": " + changed
+            + ", \"eventsMoved\": " + moved
+            + ", \"lengthMs\": " + Num(newLength)
+            + ", \"rippleMs\": " + Num(delta)
+            + ", \"takeOffsetMs\": " + Num(takeOffset) + "}";
+    }
+
+    /**
+     * Undoes the last change VEGAS recorded (Project.Undo). A test helper for the bridge's own
+     * changes. The MCP server does not expose it, because it would also undo a change made by hand.
+     */
+    private static string Undo()
+    {
+        vegasRef.Project.Undo();
+        return "{\"ok\": true, \"undone\": true}";
+    }
+
+    /** Reads the motion settings of a video event, and the first keyframe's frame and rotation. Changes nothing. */
+    private static string MotionInfo(string args)
+    {
+        var p = args.Split('|');
+        if (p.Length != 2)
+        {
+            return Error("usage: motion_info <trackIndex>|<eventIndex>");
+        }
+        var ev = FindEvent(int.Parse(p[0], CultureInfo.InvariantCulture), int.Parse(p[1], CultureInfo.InvariantCulture)) as VideoEvent;
+        if (ev == null)
+        {
+            return Error("that event is not a video event");
+        }
+        var motion = ev.VideoMotion;
+        var sb = new StringBuilder();
+        sb.Append("{\"ok\": true, \"scaleToFill\": " + (motion.ScaleToFill ? "true" : "false"));
+        int count = motion.Keyframes.Count;
+        sb.Append(", \"keyframes\": " + count);
+        if (count > 0)
+        {
+            var kf = motion.Keyframes[0];
+            sb.Append(", \"firstKeyframe\": {\"topLeft\": " + Vertex(kf.TopLeft.X, kf.TopLeft.Y)
+                + ", \"topRight\": " + Vertex(kf.TopRight.X, kf.TopRight.Y)
+                + ", \"bottomRight\": " + Vertex(kf.BottomRight.X, kf.BottomRight.Y)
+                + ", \"bottomLeft\": " + Vertex(kf.BottomLeft.X, kf.BottomLeft.Y)
+                + ", \"rotationRad\": " + kf.Rotation.ToString("F4", CultureInfo.InvariantCulture) + "}");
+        }
+        sb.Append("}");
+        return sb.ToString();
+    }
+
+    /** Turns "scale to fill" on or off for a video event. Arguments: <track>|<event>|<on|off>. */
+    private static string SetScaleToFill(string args)
+    {
+        var p = args.Split('|');
+        if (p.Length != 3)
+        {
+            return Error("usage: motion_fill <trackIndex>|<eventIndex>|<on|off>");
+        }
+        var ev = FindEvent(int.Parse(p[0], CultureInfo.InvariantCulture), int.Parse(p[1], CultureInfo.InvariantCulture)) as VideoEvent;
+        if (ev == null)
+        {
+            return Error("that event is not a video event");
+        }
+        using (new UndoBlock(vegasRef.Project, "vegas-mcp scale to fill"))
+        {
+            ev.VideoMotion.ScaleToFill = p[2] == "on" || p[2] == "1";
+        }
+        return MotionInfo(p[0] + "|" + p[1]);
+    }
+
+    private static string Vertex(double x, double y)
+    {
+        return "[" + x.ToString("F2", CultureInfo.InvariantCulture) + ", " + y.ToString("F2", CultureInfo.InvariantCulture) + "]";
     }
 
     /** Lists every render template as "Renderer :: Template", the form render expects. */

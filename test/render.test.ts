@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { avDifferenceMs, defaultRenderPath, parseStreamDurations } from "../src/vegas/render.js";
+import { avDifferenceMs, classifyContent, defaultRenderPath, parseMaxVolume, parseStreamDurations } from "../src/vegas/render.js";
 
 describe("parseStreamDurations", () => {
   it("reads video, audio and container durations from ffprobe JSON, in ms", () => {
@@ -29,6 +29,41 @@ describe("avDifferenceMs", () => {
   it("is null when either stream is missing, so a missing track is never reported as in sync", () => {
     assert.equal(avDifferenceMs({ videoMs: 1000 }), null);
     assert.equal(avDifferenceMs({ audioMs: 1000 }), null);
+  });
+});
+
+describe("classifyContent", () => {
+  // Values measured on the test project: the black and silent render read 0 and -91 dB; the good
+  // renders read 28 to 157 and -1.6 dB and up.
+  it("calls a render black when every sampled frame is near zero", () => {
+    assert.deepEqual(classifyContent([0, 0, 0, 0, 0], -1.6), { looksBlank: true, looksSilent: false });
+  });
+
+  it("calls a render silent when its loudest sample is far below any real audio", () => {
+    assert.deepEqual(classifyContent([28, 80, 73, 157, 28], -91), { looksBlank: false, looksSilent: true });
+  });
+
+  it("passes a render with picture and sound", () => {
+    assert.deepEqual(classifyContent([28, 80, 73, 157, 28], -1.6), { looksBlank: false, looksSilent: false });
+  });
+
+  it("does not call a render silent when there is no audio to measure", () => {
+    assert.deepEqual(classifyContent([28, 80], null), { looksBlank: false, looksSilent: false });
+  });
+
+  it("does not call a render black when no frame could be read", () => {
+    assert.deepEqual(classifyContent([], -1.6), { looksBlank: false, looksSilent: false });
+  });
+});
+
+describe("parseMaxVolume", () => {
+  it("reads the peak from ffmpeg's volumedetect report", () => {
+    const report = "[Parsed_volumedetect_0 @ 0x1] mean_volume: -16.9 dB\n[Parsed_volumedetect_0 @ 0x1] max_volume: -1.8 dB\n";
+    assert.equal(parseMaxVolume(report), -1.8);
+  });
+
+  it("is null when the report has no peak line", () => {
+    assert.equal(parseMaxVolume("Output file does not contain any stream"), null);
   });
 });
 

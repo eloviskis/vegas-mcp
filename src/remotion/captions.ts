@@ -3,6 +3,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { CaptionCue } from "../captions/cues.js";
+import type { CaptionStyle } from "../captions/styles.js";
 
 /**
  * Renders the Captions composition as one transparent .mov for the whole clip. Same pipeline as
@@ -27,7 +28,11 @@ export type RenderCaptionsRequest = {
   width?: number;
   height?: number;
   fps?: number;
+  style?: CaptionStyle;
+  /** Base text colour. Left out, the style's own colour is used. */
   textColor?: string;
+  /** Colour of the spoken word or its box. Left out, yellow is used. */
+  highlightColor?: string;
   /** Absolute .mov path. Defaults to <package>/out/captions-<timestamp>.mov */
   outputPath?: string;
 };
@@ -56,9 +61,12 @@ export function renderCaptions(request: RenderCaptionsRequest): RenderCaptionsRe
     request.outputPath ?? join(projectRoot, "..", "out", `captions-${Date.now()}.mov`);
   mkdirSync(dirname(outputPath), { recursive: true });
 
+  // JSON.stringify leaves out undefined colours, so the composition falls back to the style's own.
   const props = JSON.stringify({
     cues: request.cues,
-    textColor: request.textColor ?? "#FFFFFF",
+    style: request.style ?? "youtube",
+    textColor: request.textColor,
+    highlightColor: request.highlightColor,
     durationInFrames: durationFrames,
   });
 

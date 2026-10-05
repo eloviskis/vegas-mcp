@@ -5,7 +5,15 @@ import type { Word } from "../cuts/detect.js";
  * line gets too long, or until the speaker pauses, which is where a viewer naturally breaks.
  */
 
-export type CaptionCue = { startMs: number; endMs: number; text: string };
+export type CaptionWord = { text: string; startMs: number; endMs: number };
+
+export type CaptionCue = {
+  startMs: number;
+  endMs: number;
+  text: string;
+  /** The cue's words with their own times, for styles that light words up as they are spoken. */
+  words?: CaptionWord[];
+};
 
 export type CueOptions = {
   /** Most words on one line. */
@@ -30,6 +38,7 @@ export function wordsToCues(words: Word[], options: CueOptions = {}): CaptionCue
       startMs: current[0]!.startMs,
       endMs: current[current.length - 1]!.endMs,
       text: current.map((w) => w.text).join(" "),
+      words: current.map((w) => ({ text: w.text, startMs: w.startMs, endMs: w.endMs })),
     });
     current = [];
   };
@@ -47,19 +56,36 @@ export function wordsToCues(words: Word[], options: CueOptions = {}): CaptionCue
   return cues;
 }
 
+/** Where a clip sits in its media. `playbackRate` is 1 unless the clip has been sped up. */
+export type ClipTiming = { takeOffsetMs: number; lengthMs: number; playbackRate?: number };
+
 /**
- * Keeps only the part of each cue that falls inside a clip, and moves it to the clip's own time.
- * Used to turn transcript times (media time) into overlay times for one timeline clip.
+ * Moves cues from media time into one clip's own time. The clip plays its media from takeOffsetMs,
+ * and at playbackRate each media millisecond takes 1 / rate timeline milliseconds, so a cue at
+ * media 2–4 s in a clip at 2x lands at 1–2 s of the clip. Anything outside the media the clip plays
+ * is dropped, and the rest is clipped to it. Used to turn transcript times into overlay times.
  */
-export function cuesForClip(
-  cues: CaptionCue[],
-  clip: { takeOffsetMs: number; lengthMs: number },
-): CaptionCue[] {
+export function cuesForClip(cues: CaptionCue[], clip: ClipTiming): CaptionCue[] {
+  const rate = clip.playbackRate ?? 1;
+  const mediaStart = clip.takeOffsetMs;
+  const mediaEnd = clip.takeOffsetMs + clip.lengthMs * rate;
+  const toClip = (mediaMs: number) => (mediaMs - mediaStart) / rate;
+
   const out: CaptionCue[] = [];
   for (const cue of cues) {
-    const startMs = Math.max(0, cue.startMs - clip.takeOffsetMs);
-    const endMs = Math.min(clip.lengthMs, cue.endMs - clip.takeOffsetMs);
-    if (endMs > startMs) out.push({ startMs, endMs, text: cue.text });
+    const startMs = toClip(Math.max(cue.startMs, mediaStart));
+    const endMs = Math.min(clip.lengthMs, toClip(Math.min(cue.endMs, mediaEnd)));
+    if (endMs <= startMs) continue;
+
+    const moved: CaptionCue = { startMs, endMs, text: cue.text };
+    if (cue.words) {
+      moved.words = cue.words.flatMap((word) => {
+        const wordStart = toClip(Math.max(word.startMs, mediaStart));
+        const wordEnd = Math.min(clip.lengthMs, toClip(Math.min(word.endMs, mediaEnd)));
+        return wordEnd > wordStart ? [{ text: word.text, startMs: wordStart, endMs: wordEnd }] : [];
+      });
+    }
+    out.push(moved);
   }
   return out;
 }

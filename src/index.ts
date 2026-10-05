@@ -6,9 +6,11 @@ import { renderOverlay } from "./remotion/bridge.js";
 import { prepareSubtitles } from "./workflows/srt.js";
 import { findSpeechCuts, listAudioTracks, readWords, readWordsSource, transcribeSpeech } from "./workflows/speech.js";
 import { cuesForClip, wordsToCues } from "./captions/cues.js";
+import { CAPTION_STYLE_HELP, CAPTION_STYLES } from "./captions/styles.js";
 import { renderCaptions } from "./remotion/captions.js";
 import { sendBridgeCommand } from "./vegas/bridge.js";
-import { avDifferenceMs, defaultRenderPath, probeDurations, probeVideoSize } from "./vegas/render.js";
+import { avDifferenceMs, defaultRenderPath, inspectContent, probeDurations, probeVideoSize } from "./vegas/render.js";
+import { buildSheet, defaultSheetPath } from "./vegas/preview.js";
 import { logAction } from "./log/actions.js";
 import { fadeNormalizeConflict, type AudioState } from "./vegas/audio.js";
 import {
@@ -375,7 +377,7 @@ server.registerTool(
   {
     title: "Render the open VEGAS project to a file",
     description:
-      "Exports the whole open VEGAS project with a template from vegas_list_render_templates, then reads the file back with ffprobe and reports whether the video and audio lengths match. Never overwrites an existing file. VEGAS does not answer until the render finishes, which can take minutes.",
+      "Exports the whole open VEGAS project with a template from vegas_list_render_templates, then reads the file back: whether the video and audio lengths match, and whether it has picture and sound. A render can have the right length and still be black and silent, so the content is checked too and a warning is returned. Never overwrites an existing file. VEGAS does not answer until the render finishes, which can take minutes.",
     inputSchema: {
       template: z.string().describe("'Renderer :: Template' name from vegas_list_render_templates"),
       outputPath: z.string().optional().describe("Absolute path for the file. Defaults to <package>/out/renders/"),
@@ -386,32 +388,69 @@ server.registerTool(
       const target = outputPath ?? defaultRenderPath();
       const reply = await sendBridgeCommand(`render ${template}|${target}`, { timeoutMs: 35 * 60_000 });
       const durations = probeDurations(target);
+      const content = inspectContent(target, durations.containerMs ?? 0);
+      const problems = [content.looksBlank ? "black" : "", content.looksSilent ? "silent" : ""].filter(Boolean);
       return {
         ...reply,
         durations,
         avDifferenceMs: avDifferenceMs(durations),
+        content,
+        ...(problems.length > 0
+          ? { warning: `The render looks ${problems.join(" and ")}. Its length is right, so the length check cannot catch this. Check the file before using it, and render again if it is wrong.` }
+          : {}),
         note: "avDifferenceMs close to 0 means video and audio end together. The source media was not changed.",
       };
     }),
 );
 
 server.registerTool(
+  "preview_sheet",
+  {
+    title: "Build a contact sheet of frames from a video file",
+    description:
+      "Tiles frames spread evenly over a video file into one PNG, so a render can be checked at a glance. Frames read left to right, top to bottom, and the reply gives the time of each. Works on any video file and never changes it. Uses ffmpeg.",
+    inputSchema: {
+      path: z.string().describe("Absolute path to the video file"),
+      frames: z.number().int().min(1).max(60).optional().describe("How many frames. Defaults to 12"),
+      columns: z.number().int().min(1).max(12).optional().describe("Frames per row. Defaults to 4"),
+      width: z.number().int().min(80).max(960).optional().describe("Width of each frame in pixels. Defaults to 320"),
+      outputPath: z.string().optional().describe("Absolute .png path. Defaults to <package>/out/sheets/"),
+    },
+  },
+  async ({ path, frames, columns, width, outputPath }) =>
+    asyncLogged("preview_sheet", async () => {
+      // A file ffprobe reads no length for becomes 0, and buildSheet refuses it with a clear message.
+      const { containerMs } = probeDurations(path);
+      return buildSheet(path, outputPath ?? defaultSheetPath(path), containerMs ?? 0, { frames, columns, width });
+    }),
+);
+
+const captionStyleList = Object.entries(CAPTION_STYLE_HELP)
+  .map(([name, help]) => name + ": " + help)
+  .join("; ");
+
+server.registerTool(
   "vegas_add_captions",
   {
     title: "Burn captions from a transcript onto a VEGAS clip",
     description:
-      "Groups the transcript's words into caption lines, renders them as one transparent layer over the clip, and places that layer on a new VEGAS track at the top. The clip must be the transcribed media. Captions are an overlay, not VEGAS subtitle events, because the VEGAS scripting API has no subtitle import. Rendering takes several minutes for long clips.",
+      "Groups the transcript's words into caption lines, renders them as one transparent layer over the clip, and places that layer on a new VEGAS track at the top. The clip must be the transcribed media. Captions are an overlay, not VEGAS subtitle events, because the VEGAS scripting API has no subtitle import. A clip that was sped up with vegas_set_speed gets its captions retimed to match. Rendering takes several minutes for long clips.",
     inputSchema: {
       wordsPath: z.string().describe("Absolute path to the .words.json of the clip's media"),
       trackIndex: z.number().int().min(0).optional().describe("Optional: track of one specific clip. Leave out to use every video clip that plays the transcribed media"),
       eventIndex: z.number().int().min(0).optional().describe("Optional: event on that track, used with trackIndex"),
-      textColor: z.string().optional().describe("#RRGGBB text colour. Defaults to #FFFFFF"),
+      style: z
+        .enum(CAPTION_STYLES)
+        .optional()
+        .describe("Look of the captions. Defaults to youtube. " + captionStyleList),
+      textColor: z.string().optional().describe("#RRGGBB text colour. Left out, the style's own colour is used"),
+      highlightColor: z.string().optional().describe("#RRGGBB colour of the spoken word or its box in the karaoke styles. Defaults to #FFD400"),
       maxWords: z.number().int().positive().optional().describe("Most words on one caption line. Defaults to 7"),
       maxChars: z.number().int().positive().optional().describe("Most characters on one caption line. Defaults to 42"),
       breakGapMs: z.number().positive().optional().describe("A pause this long starts a new caption line. Defaults to 600"),
     },
   },
-  async ({ wordsPath, trackIndex, eventIndex, textColor, maxWords, maxChars, breakGapMs }) =>
+  async ({ wordsPath, trackIndex, eventIndex, style, textColor, highlightColor, maxWords, maxChars, breakGapMs }) =>
     asyncLogged("vegas_add_captions", async () => {
       const { timeline } = await readTimeline();
       const selected = selectClips(timeline, readWordsSource(wordsPath), trackIndex, eventIndex);
@@ -420,17 +459,21 @@ server.registerTool(
 
       // One caption layer per clip that plays the media, each the length of its clip.
       const layers = [];
-      for (const { clip } of selected) {
+      for (const { trackIndex: clipTrack, clip } of selected) {
         // Captions match the clip's own shape: landscape footage gets a landscape layer, portrait gets portrait.
         const size = probeVideoSize(clip.mediaPath!) ?? { width: 1920, height: 1080 };
         const landscape = size.width >= size.height;
-        const local = cuesForClip(cues, { takeOffsetMs: clip.takeOffsetMs, lengthMs: clip.lengthMs });
+        // A sped-up clip plays its media faster, so its captions are retimed to match.
+        const playbackRate = Number((await sendBridgeCommand(`audio_info ${clipTrack} ${clip.index}`)).playbackRate ?? 1);
+        const local = cuesForClip(cues, { takeOffsetMs: clip.takeOffsetMs, lengthMs: clip.lengthMs, playbackRate });
         const rendered = renderCaptions({
           cues: local,
           durationMs: clip.lengthMs,
           width: landscape ? 1920 : 1080,
           height: landscape ? 1080 : 1920,
+          style,
           textColor,
+          highlightColor,
         });
         const overlay = await sendBridgeCommand(
           `overlay ${rendered.path}|${clip.startMs}|${clip.lengthMs}`,
@@ -439,6 +482,8 @@ server.registerTool(
         layers.push({
           placedAtMs: clip.startMs,
           lengthMs: clip.lengthMs,
+          playbackRate,
+          style: style ?? "youtube",
           captionLines: local.length,
           layerPath: rendered.path,
           renderSeconds: rendered.renderSeconds,
@@ -509,6 +554,55 @@ server.registerTool(
       if (conflict) throw new Error(conflict);
       return sendBridgeCommand(`normalize ${trackIndex}|${eventIndex}|${normalize ? "on" : "off"}`);
     }),
+);
+
+server.registerTool(
+  "vegas_set_speed",
+  {
+    title: "Change the speed of a VEGAS clip and its audio",
+    description:
+      "Speeds up a clip and its audio counterpart so they stay together, and the clip gets shorter. VEGAS retimes it, then the clips after it move back to close the gap. Rate 2 plays twice as fast and halves the clip. Speed-up only, from 1 to 10: to slow down or go back to normal, undo in VEGAS with Ctrl+Z. Captions added before the change keep their old timing and must be added again. Changes the project. Call only after the user asked for it.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0).describe("Track of the clip, 0-based"),
+      eventIndex: z.number().int().min(0).describe("Event on that track, 0-based"),
+      rate: z.number().min(1).max(10).describe("Speed-up rate: 2 is twice as fast"),
+    },
+  },
+  async ({ trackIndex, eventIndex, rate }) =>
+    asyncLogged("vegas_set_speed", () => sendBridgeCommand(`speed ${trackIndex}|${eventIndex}|${rate}`)),
+);
+
+server.registerTool(
+  "vegas_motion_info",
+  {
+    title: "Read the motion settings of a VEGAS video clip",
+    description:
+      "Reads whether the clip is scaled to fill the frame, how many motion keyframes it has, and the first keyframe's frame corners and rotation. Read-only.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0).describe("Track of the video clip, 0-based"),
+      eventIndex: z.number().int().min(0).describe("Event on that track, 0-based"),
+    },
+  },
+  async ({ trackIndex, eventIndex }) =>
+    asyncLogged("vegas_motion_info", () => sendBridgeCommand(`motion_info ${trackIndex}|${eventIndex}`)),
+);
+
+server.registerTool(
+  "vegas_set_scale_to_fill",
+  {
+    title: "Scale a VEGAS video clip to fill the frame, or undo that",
+    description:
+      "Turns 'scale to fill' on or off for a video clip, which enlarges the clip so it covers the whole frame. Changes the project; undo with Ctrl+Z. Call only after the user asked for it.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0).describe("Track of the video clip, 0-based"),
+      eventIndex: z.number().int().min(0).describe("Event on that track, 0-based"),
+      on: z.boolean().describe("true to scale to fill, false to turn it off"),
+    },
+  },
+  async ({ trackIndex, eventIndex, on }) =>
+    asyncLogged("vegas_set_scale_to_fill", () =>
+      sendBridgeCommand(`motion_fill ${trackIndex}|${eventIndex}|${on ? "on" : "off"}`),
+    ),
 );
 
 const transport = new StdioServerTransport();
