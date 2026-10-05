@@ -10,6 +10,7 @@ import { renderCaptions } from "./remotion/captions.js";
 import { sendBridgeCommand } from "./vegas/bridge.js";
 import { avDifferenceMs, defaultRenderPath, probeDurations, probeVideoSize } from "./vegas/render.js";
 import { logAction } from "./log/actions.js";
+import { fadeNormalizeConflict, type AudioState } from "./vegas/audio.js";
 import {
   PlanStore,
   expectedLengthAfter,
@@ -63,6 +64,16 @@ const asyncLogged = async (tool: string, fn: () => Promise<unknown>) => {
 };
 
 const plans = new PlanStore();
+
+/** Reads an event's current fades and normalisation from VEGAS, for the conflict check. */
+const readAudioState = async (trackIndex: number, eventIndex: number): Promise<AudioState> => {
+  const info = await sendBridgeCommand(`audio_info ${trackIndex} ${eventIndex}`);
+  return {
+    fadeInMs: Number(info.fadeInMs ?? 0),
+    fadeOutMs: Number(info.fadeOutMs ?? 0),
+    normalize: info.normalize === true,
+  };
+};
 
 type TimelineEvent = {
   index: number;
@@ -439,6 +450,64 @@ server.registerTool(
         layers,
         note: "Each caption layer is a new track above the clips. Undo with Ctrl+Z in VEGAS.",
       };
+    }),
+);
+
+server.registerTool(
+  "vegas_audio_info",
+  {
+    title: "Read the fades, playback rate, mute and normalisation of a VEGAS event",
+    description:
+      "Reads one event's fade-in and fade-out lengths and curves, playback rate, mute, and, for audio events, normalisation and its gain. Track and event indexes come from vegas_list_timeline. Read-only.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0).describe("Track of the event, 0-based"),
+      eventIndex: z.number().int().min(0).describe("Event on that track, 0-based"),
+    },
+  },
+  async ({ trackIndex, eventIndex }) =>
+    asyncLogged("vegas_audio_info", () => sendBridgeCommand(`audio_info ${trackIndex} ${eventIndex}`)),
+);
+
+server.registerTool(
+  "vegas_set_fades",
+  {
+    title: "Set the fade-in and fade-out of a VEGAS event",
+    description:
+      "Sets how long an event fades in and out, in ms. The two fades may not overlap, and cannot be longer than the event. Works on video and audio events. Changes the project; undo with Ctrl+Z in VEGAS. Call only after the user asked for it.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0).describe("Track of the event, 0-based"),
+      eventIndex: z.number().int().min(0).describe("Event on that track, 0-based"),
+      fadeInMs: z.number().min(0).describe("Fade-in length in ms; 0 for none"),
+      fadeOutMs: z.number().min(0).describe("Fade-out length in ms; 0 for none"),
+    },
+  },
+  async ({ trackIndex, eventIndex, fadeInMs, fadeOutMs }) =>
+    asyncLogged("vegas_set_fades", async () => {
+      const current = await readAudioState(trackIndex, eventIndex);
+      const conflict = fadeNormalizeConflict(current, { fadeInMs, fadeOutMs });
+      if (conflict) throw new Error(conflict);
+      return sendBridgeCommand(`fade ${trackIndex}|${eventIndex}|${fadeInMs}|${fadeOutMs}`);
+    }),
+);
+
+server.registerTool(
+  "vegas_set_normalize",
+  {
+    title: "Turn audio normalisation on or off for a VEGAS audio event",
+    description:
+      "Turns normalisation on or off for an audio event. When turned on, VEGAS recalculates the gain so the event's peak reaches the normalisation target. Audio events only. Changes the project; undo with Ctrl+Z in VEGAS. Call only after the user asked for it.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0).describe("Audio track of the event, 0-based"),
+      eventIndex: z.number().int().min(0).describe("Event on that track, 0-based"),
+      normalize: z.boolean().describe("true to normalise, false to turn it off"),
+    },
+  },
+  async ({ trackIndex, eventIndex, normalize }) =>
+    asyncLogged("vegas_set_normalize", async () => {
+      const current = await readAudioState(trackIndex, eventIndex);
+      const conflict = fadeNormalizeConflict(current, { normalize });
+      if (conflict) throw new Error(conflict);
+      return sendBridgeCommand(`normalize ${trackIndex}|${eventIndex}|${normalize ? "on" : "off"}`);
     }),
 );
 

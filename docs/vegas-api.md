@@ -53,3 +53,12 @@ Fontes de referência, todas locais na instalação:
 - `Project.Render(path, template)` com um template real: a listagem e o render estão implementados, mas não foram executados ao vivo.
 - `AddVideoEvent` e `AddTake` para um overlay: implementados, compilam, ainda não rodaram.
 - Qualquer efeito, transição, velocidade, fade, normalização e marcador: só existem no XML.
+
+## Áudio (medido no render)
+
+- **Fade de entrada e de saída funcionam no render.** `TrackEvent.FadeIn.Length` e `FadeOut.Length` aparecem na mídia renderizada como rampas: entrada de 1 s, de silêncio a 0,1 s até o nível normal perto de 1 s; saída de 1 s, de 19,0 s até quase zero em 19,9 s. Medido por janelas de 50 ms contra o original, com o atraso do render compensado.
+- **Normalização funciona, mas o pico pode passar de 1,0.** `AudioEvent.Normalize = true` com `RecalculateNorm()` deu ganho de 1,237. O render escalou o pico pelo mesmo fator (0,8165 para 1,0112 nos dois canais), então o pico encosta em 1,0 e pode cortar um pouco.
+- **Fade e normalização no mesmo evento renderizam em silêncio.** Reproduzido duas vezes. Com só um dos dois, o áudio sai normal. As tools recusam a combinação antes de tocar no VEGAS.
+- **O render sai cerca de 3,3 dB acima do arquivo original**, sem nenhuma mudança minha no volume. Não confirmei a causa. A API tem `AudioTrack.Volume`, ainda não lido pela bridge. Vale conferir o fader da trilha de áudio no VEGAS.
+- **O áudio do render chega cerca de 90 ms depois do áudio do original decodificado pelo ffmpeg.** Os dois streams começam em 0 no arquivo, e o deslocamento está no conteúdo. Pode ser diferença de decodificação do atraso inicial do AAC, e não um erro do render. Não confirmado com imagem.
+- **Houve dois renders mudos antes de qualquer mudança de áudio** (16:28 e 16:44). Não reproduzidos no estado atual, que renderiza com som. Causa desconhecida.

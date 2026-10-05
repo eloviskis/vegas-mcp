@@ -198,6 +198,14 @@ public class EntryPoint
                 case "alpha":
                     if (parts.Length != 3) return Error("usage: alpha <trackIndex>");
                     return Alpha(parts[2]);
+                case "audio_info":
+                    if (parts.Length != 4) return Error("usage: audio_info <trackIndex> <eventIndex>");
+                    return AudioInfo(int.Parse(parts[2], CultureInfo.InvariantCulture),
+                                     int.Parse(parts[3], CultureInfo.InvariantCulture));
+                case "fade":
+                    return SetFades(ArgsAfter(line, 2));
+                case "normalize":
+                    return SetNormalize(ArgsAfter(line, 2));
                 case "render_templates":
                     return RenderTemplates();
                 case "render":
@@ -306,6 +314,94 @@ public class EntryPoint
             }
         }
         return "{\"ok\": true, \"track\": " + trackIndex + ", \"clipsMarked\": " + marked + "}";
+    }
+
+    private static TrackEvent FindEvent(int trackIndex, int eventIndex)
+    {
+        return vegasRef.Project.Tracks[trackIndex].Events[eventIndex];
+    }
+
+    /** Reads the fades, playback rate, mute and, for audio, the normalisation of one event. Changes nothing. */
+    private static string AudioInfo(int trackIndex, int eventIndex)
+    {
+        var ev = FindEvent(trackIndex, eventIndex);
+        var audio = ev as AudioEvent;
+        var sb = new StringBuilder();
+        sb.Append("{\"ok\": true, \"track\": " + trackIndex + ", \"event\": " + eventIndex);
+        sb.Append(", \"kind\": " + Quote(audio != null ? "audio" : "video"));
+        sb.Append(", \"lengthMs\": " + Num(ev.Length.ToMilliseconds()));
+        sb.Append(", \"fadeInMs\": " + Num(ev.FadeIn.Length.ToMilliseconds()));
+        sb.Append(", \"fadeInCurve\": " + Quote(ev.FadeIn.Curve.ToString()));
+        sb.Append(", \"fadeOutMs\": " + Num(ev.FadeOut.Length.ToMilliseconds()));
+        sb.Append(", \"fadeOutCurve\": " + Quote(ev.FadeOut.Curve.ToString()));
+        sb.Append(", \"playbackRate\": " + ev.PlaybackRate.ToString("F4", CultureInfo.InvariantCulture));
+        sb.Append(", \"mute\": " + (ev.Mute ? "true" : "false"));
+        if (audio != null)
+        {
+            sb.Append(", \"normalize\": " + (audio.Normalize ? "true" : "false"));
+            sb.Append(", \"normalizeGain\": " + audio.NormalizeGain.ToString("F3", CultureInfo.InvariantCulture));
+        }
+        sb.Append("}");
+        return sb.ToString();
+    }
+
+    /**
+     * Sets the fade-in and fade-out lengths of one event. Arguments: <track>|<event>|<fadeInMs>|<fadeOutMs>.
+     * The two fades may not overlap.
+     */
+    private static string SetFades(string args)
+    {
+        var p = args.Split('|');
+        if (p.Length != 4)
+        {
+            return Error("usage: fade <trackIndex>|<eventIndex>|<fadeInMs>|<fadeOutMs>");
+        }
+        var ev = FindEvent(int.Parse(p[0], CultureInfo.InvariantCulture), int.Parse(p[1], CultureInfo.InvariantCulture));
+        var fadeIn = double.Parse(p[2], CultureInfo.InvariantCulture);
+        var fadeOut = double.Parse(p[3], CultureInfo.InvariantCulture);
+        if (fadeIn < 0 || fadeOut < 0)
+        {
+            return Error("fade lengths cannot be negative");
+        }
+        if (fadeIn + fadeOut > ev.Length.ToMilliseconds())
+        {
+            return Error("the two fades together are longer than the event");
+        }
+
+        using (new UndoBlock(vegasRef.Project, "vegas-mcp fades"))
+        {
+            ev.FadeIn.Length = new Timecode(fadeIn);
+            ev.FadeOut.Length = new Timecode(fadeOut);
+        }
+        return AudioInfo(int.Parse(p[0], CultureInfo.InvariantCulture), int.Parse(p[1], CultureInfo.InvariantCulture));
+    }
+
+    /** Turns audio normalisation on or off for one audio event. Arguments: <track>|<event>|<on|off>. */
+    private static string SetNormalize(string args)
+    {
+        var p = args.Split('|');
+        if (p.Length != 3)
+        {
+            return Error("usage: normalize <trackIndex>|<eventIndex>|<on|off>");
+        }
+        int trackIndex = int.Parse(p[0], CultureInfo.InvariantCulture);
+        int eventIndex = int.Parse(p[1], CultureInfo.InvariantCulture);
+        var audio = FindEvent(trackIndex, eventIndex) as AudioEvent;
+        if (audio == null)
+        {
+            return Error("that event is not an audio event");
+        }
+        var on = p[2] == "on" || p[2] == "1";
+
+        using (new UndoBlock(vegasRef.Project, "vegas-mcp normalize"))
+        {
+            audio.Normalize = on;
+            if (on)
+            {
+                audio.RecalculateNorm();
+            }
+        }
+        return AudioInfo(trackIndex, eventIndex);
     }
 
     /** Lists every render template as "Renderer :: Template", the form render expects. */
