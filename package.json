@@ -1,0 +1,29 @@
+{
+  "name": "vegas-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MCP server that renders alpha-channel motion graphics and prepares subtitles for editing in VEGAS Pro. Independent, unofficial, not affiliated with MAGIX.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "vegas-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "node --import tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test --test-reporter=spec test/*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.23.1",
+    "typescript": "5.6.3"
+  },
+  "license": "MIT"
+}
