@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { renderOverlay } from "./remotion/bridge.js";
 import { prepareSubtitles } from "./workflows/srt.js";
+import { findSpeechCuts, transcribeSpeech } from "./workflows/speech.js";
 
 /**
  * vegas-mcp — independent, unofficial. Not affiliated with MAGIX.
@@ -72,6 +73,40 @@ server.registerTool(
     },
   },
   async (args) => asToolResult(() => prepareSubtitles(args)),
+);
+
+server.registerTool(
+  "transcribe_speech",
+  {
+    title: "Transcribe speech locally with word timestamps",
+    description:
+      "Extracts audio with ffmpeg and transcribes it on this machine with faster-whisper, keeping stutters and repeats so find_speech_cuts can see them. Writes <name>.words.json to out/ and never changes the source file. Slow on long media: CPU transcription takes a fraction of the clip's length or more.",
+    inputSchema: {
+      path: z.string().describe("Absolute path to a video or audio file"),
+      outputDir: z.string().optional().describe("Where to write the WAV and JSON; defaults to <package>/out/"),
+      model: z.string().optional().describe("Whisper size: tiny, base, small, medium or large-v3. Defaults to small"),
+      language: z.string().optional().describe("ISO code such as pt. Omit to detect"),
+      verbatim: z.boolean().optional().describe("Keep stutters and fillers. Defaults to true"),
+    },
+  },
+  async (args) => asToolResult(() => transcribeSpeech(args)),
+);
+
+server.registerTool(
+  "find_speech_cuts",
+  {
+    title: "Find pauses and repeated takes in a transcript",
+    description:
+      "Reads a .words.json from transcribe_speech and lists the ranges to cut: silences longer than minPauseMs, and phrases said twice in a row, where the last take is kept. Each cut includes the words it removes, for review. Nothing is edited.",
+    inputSchema: {
+      wordsPath: z.string().describe("Absolute path to a .words.json file"),
+      minPauseMs: z.number().optional().describe("Silences at least this long are cut. Defaults to 700"),
+      pausePaddingMs: z.number().optional().describe("Breathing room kept at each edge of a cut pause. Defaults to 250"),
+      maxRepeatWords: z.number().optional().describe("Longest repeated phrase, in words. Defaults to 6"),
+      maxRepeatGapMs: z.number().optional().describe("Copies further apart than this are not a restart. Defaults to 4000"),
+    },
+  },
+  async (args) => asToolResult(() => findSpeechCuts(args)),
 );
 
 const transport = new StdioServerTransport();
