@@ -27,7 +27,7 @@ describe("timelineFingerprint", () => {
 
 describe("sameMediaFile", () => {
   it("treats slash direction and letter case as the same Windows file", () => {
-    assert.equal(sameMediaFile("C:\\Users\\elovi\\Videos\\IMG_6592.MOV", "c:/users/elovi/videos/img_6592.mov"), true);
+    assert.equal(sameMediaFile("C:\\Users\\example\\Videos\\IMG_6592.MOV", "c:/users/example/videos/img_6592.mov"), true);
   });
 
   it("refuses a different file, or a missing path", () => {
@@ -173,17 +173,17 @@ const SNAP: TimelineSnapshot = {
       index: 1,
       type: "video",
       events: [
-        { index: 0, startMs: 0, lengthMs: 20000, grouped: true, takeOffsetMs: 0, mediaPath: "C:/Users/elovi/Downloads/d4c6fe15.mp4" },
-        { index: 1, startMs: 20000, lengthMs: 59583, grouped: true, takeOffsetMs: 25000, mediaPath: "C:/Users/elovi/Downloads/d4c6fe15.mp4" },
+        { index: 0, startMs: 0, lengthMs: 20000, grouped: true, takeOffsetMs: 0, mediaPath: "C:/Users/example/Downloads/clip.mp4" },
+        { index: 1, startMs: 20000, lengthMs: 59583, grouped: true, takeOffsetMs: 25000, mediaPath: "C:/Users/example/Downloads/clip.mp4" },
       ],
     },
-    { index: 2, type: "audio", events: [{ index: 0, startMs: 0, lengthMs: 20000, grouped: true, takeOffsetMs: 0, mediaPath: "C:/Users/elovi/Downloads/d4c6fe15.mp4" }] },
+    { index: 2, type: "audio", events: [{ index: 0, startMs: 0, lengthMs: 20000, grouped: true, takeOffsetMs: 0, mediaPath: "C:/Users/example/Downloads/clip.mp4" }] },
   ],
 };
 
 describe("selectClips", () => {
   it("finds every video clip that plays the transcribed media, whatever its track number", () => {
-    const found = selectClips(SNAP, "C:/Users/elovi/Downloads/d4c6fe15.mp4");
+    const found = selectClips(SNAP, "C:/Users/example/Downloads/clip.mp4");
     assert.deepEqual(found.map((f) => [f.trackIndex, f.clip.index]), [[1, 0], [1, 1]]);
   });
 
@@ -192,8 +192,8 @@ describe("selectClips", () => {
   });
 
   it("uses an explicit track and event only when that clip plays the same media", () => {
-    assert.deepEqual(selectClips(SNAP, "C:/Users/elovi/Downloads/d4c6fe15.mp4", 1, 1).map((f) => f.clip.startMs), [20000]);
-    assert.throws(() => selectClips(SNAP, "C:/Users/elovi/Downloads/d4c6fe15.mp4", 0, 0), /overlay/);
+    assert.deepEqual(selectClips(SNAP, "C:/Users/example/Downloads/clip.mp4", 1, 1).map((f) => f.clip.startMs), [20000]);
+    assert.throws(() => selectClips(SNAP, "C:/Users/example/Downloads/clip.mp4", 0, 0), /overlay/);
   });
 });
 
