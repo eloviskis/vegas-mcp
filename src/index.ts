@@ -605,5 +605,66 @@ server.registerTool(
     ),
 );
 
+server.registerTool(
+  "vegas_set_motion",
+  {
+    title: "Zoom and move a VEGAS video clip inside the frame",
+    description:
+      "Places a video clip in the frame by changing its motion keyframes. Scale 1 is the full frame; less than 1 makes it smaller, centred on the frame. moveX and moveY shift it in project pixels (positive moves right and down). Each call sets the placement again; it does not add to the last one. Turns scale to fill off. Experimental: zooming in is not supported, because the render does not show it, and some placements rendered black and silent in tests, so check the result with vegas_render. Changes the project; undo with Ctrl+Z. Call only after the user asked for it.",
+    inputSchema: {
+      trackIndex: z.number().int().min(0).describe("Track of the video clip, 0-based"),
+      eventIndex: z.number().int().min(0).describe("Event on that track, 0-based"),
+      scale: z.number().min(0.1).max(1).optional().describe("Size against the frame: 1 is the full frame, 0.8 is 80 percent of it. Zooming in (above 1) is refused. Defaults to 1"),
+      moveX: z.number().optional().describe("Move in project pixels: positive moves right. Defaults to 0"),
+      moveY: z.number().optional().describe("Move in project pixels: positive moves down. Defaults to 0"),
+    },
+  },
+  async ({ trackIndex, eventIndex, scale, moveX, moveY }) =>
+    asyncLogged("vegas_set_motion", () =>
+      sendBridgeCommand(`motion ${trackIndex}|${eventIndex}|${scale ?? 1}|${moveX ?? 0}|${moveY ?? 0}`),
+    ),
+);
+
+server.registerTool(
+  "vegas_list_markers",
+  {
+    title: "List the time line markers of the open VEGAS project",
+    description: "Lists every time line marker with its index, its position in ms and its label. Read-only.",
+    inputSchema: {},
+  },
+  async () => asyncLogged("vegas_list_markers", () => sendBridgeCommand("marker_list")),
+);
+
+server.registerTool(
+  "vegas_add_marker",
+  {
+    title: "Add a time line marker to the open VEGAS project",
+    description:
+      "Adds a labelled marker on the time line at a position in ms. Markers do not change the picture or the sound. Changes the project; undo with Ctrl+Z. Call only after the user asked for it.",
+    inputSchema: {
+      timeMs: z.number().min(0).describe("Position on the time line, in ms"),
+      label: z.string().max(120).describe("Text shown on the marker"),
+    },
+  },
+  async ({ timeMs, label }) =>
+    asyncLogged("vegas_add_marker", () => {
+      if (label.includes("\n")) throw new Error("A marker label must be one line.");
+      return sendBridgeCommand(`marker_add ${timeMs}|${label}`);
+    }),
+);
+
+server.registerTool(
+  "vegas_remove_marker",
+  {
+    title: "Remove one time line marker from the open VEGAS project",
+    description:
+      "Removes a marker by the index that vegas_list_markers reports. Indexes shift after a removal, so list again before removing another. Changes the project; undo with Ctrl+Z. Call only after the user asked for it.",
+    inputSchema: {
+      index: z.number().int().min(0).describe("Index from vegas_list_markers, 0-based"),
+    },
+  },
+  async ({ index }) => asyncLogged("vegas_remove_marker", () => sendBridgeCommand(`marker_remove ${index}`)),
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);

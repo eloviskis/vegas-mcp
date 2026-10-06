@@ -218,6 +218,14 @@ public class EntryPoint
                     return RenderTemplates();
                 case "render":
                     return Render(ArgsAfter(line, 2));
+                case "motion":
+                    return SetMotion(ArgsAfter(line, 2));
+                case "marker_add":
+                    return AddMarker(ArgsAfter(line, 2));
+                case "marker_list":
+                    return ListMarkers();
+                case "marker_remove":
+                    return RemoveMarker(ArgsAfter(line, 2));
                 case "undo":
                     return Undo();
                 case "stop":
@@ -240,7 +248,10 @@ public class EntryPoint
         return "{\"ok\": true, \"tracks\": " + tracks
             + ", \"projectLengthMs\": " + Num(vegasRef.Project.Length.ToMilliseconds())
             + ", \"projectPath\": " + Quote(vegasRef.Project.FilePath)
-            + ", \"projectModified\": " + (vegasRef.Project.IsModified ? "true" : "false") + "}";
+            + ", \"projectModified\": " + (vegasRef.Project.IsModified ? "true" : "false")
+            + ", \"projectWidth\": " + Num(vegasRef.Project.Video.Width)
+            + ", \"projectHeight\": " + Num(vegasRef.Project.Video.Height)
+            + ", \"bridgeVersion\": 5}";
     }
 
     /** Returns the text of a request line after its first `words` space-separated words. Keeps spaces in paths. */
@@ -608,6 +619,126 @@ public class EntryPoint
             ev.VideoMotion.ScaleToFill = p[2] == "on" || p[2] == "1";
         }
         return MotionInfo(p[0] + "|" + p[1]);
+    }
+
+    /**
+     * Places a video clip in the frame. Its box becomes scale times the project frame, centred at the
+     * frame centre moved by moveX and moveY, in project pixels (positive moves right and down). The
+     * result does not depend on earlier moves, so calling it again sets the placement again.
+     * Arguments: <track>|<event>|<scale>|<moveX>|<moveY>. Scale to fill is turned off first, because
+     * it would replace the keyframes. One undo step. Rotated keyframes are refused.
+     */
+    private static string SetMotion(string args)
+    {
+        var p = args.Split('|');
+        if (p.Length != 5)
+        {
+            return Error("usage: motion <trackIndex>|<eventIndex>|<scale>|<moveX>|<moveY>");
+        }
+        var ev = FindEvent(int.Parse(p[0], CultureInfo.InvariantCulture), int.Parse(p[1], CultureInfo.InvariantCulture)) as VideoEvent;
+        if (ev == null)
+        {
+            return Error("that event is not a video event");
+        }
+        var scale = double.Parse(p[2], CultureInfo.InvariantCulture);
+        var moveX = double.Parse(p[3], CultureInfo.InvariantCulture);
+        var moveY = double.Parse(p[4], CultureInfo.InvariantCulture);
+        if (!(scale >= 0.1 && scale <= 10))
+        {
+            return Error("scale must be between 0.1 and 10");
+        }
+
+        // Check every keyframe before changing any, so a refusal leaves the clip as it was.
+        var motion = ev.VideoMotion;
+        for (int i = 0; i < motion.Keyframes.Count; i++)
+        {
+            var check = motion.Keyframes[i];
+            if (Math.Abs(check.Rotation) > 0.000001)
+            {
+                return Error("this clip is rotated; set its rotation back to 0 first");
+            }
+            if (!(check.BottomRight.X - check.TopLeft.X > 0) || !(check.BottomRight.Y - check.TopLeft.Y > 0))
+            {
+                return Error("a keyframe of this clip has no size");
+            }
+        }
+
+        double frameW = vegasRef.Project.Video.Width;
+        double frameH = vegasRef.Project.Video.Height;
+        int changed = 0;
+        using (new UndoBlock(vegasRef.Project, "vegas-mcp motion"))
+        {
+            motion.ScaleToFill = false;
+            for (int i = 0; i < motion.Keyframes.Count; i++)
+            {
+                var kf = motion.Keyframes[i];
+                double w0 = kf.BottomRight.X - kf.TopLeft.X;
+                double h0 = kf.BottomRight.Y - kf.TopLeft.Y;
+                double cx0 = (kf.TopLeft.X + kf.BottomRight.X) / 2.0;
+                double cy0 = (kf.TopLeft.Y + kf.BottomRight.Y) / 2.0;
+                // Move the box centre to the origin, scale it to the target size, then move it to the target centre.
+                kf.MoveBy(new VideoMotionVertex((float)(-cx0), (float)(-cy0)));
+                kf.ScaleBy(new VideoMotionVertex((float)(frameW * scale / w0), (float)(frameH * scale / h0)));
+                kf.MoveBy(new VideoMotionVertex((float)(frameW / 2.0 + moveX), (float)(frameH / 2.0 + moveY)));
+                changed++;
+            }
+        }
+        return "{\"ok\": true, \"keyframesChanged\": " + changed
+            + ", \"projectWidth\": " + Num(frameW) + ", \"projectHeight\": " + Num(frameH)
+            + ", \"after\": " + MotionInfo(p[0] + "|" + p[1]) + "}";
+    }
+
+    /** Adds a time line marker. Arguments: <timeMs>|<label>. Markers do not change the picture or the sound. */
+    private static string AddMarker(string args)
+    {
+        var p = args.Split(new[] { '|' }, 2);
+        if (p.Length != 2)
+        {
+            return Error("usage: marker_add <timeMs>|<label>");
+        }
+        var timeMs = double.Parse(p[0], CultureInfo.InvariantCulture);
+        if (timeMs < 0)
+        {
+            return Error("a marker needs a time of 0 or more");
+        }
+        using (new UndoBlock(vegasRef.Project, "vegas-mcp marker"))
+        {
+            vegasRef.Project.Markers.Add(new Marker(new Timecode(timeMs), p[1]));
+        }
+        return "{\"ok\": true, \"count\": " + vegasRef.Project.Markers.Count + "}";
+    }
+
+    /** Lists the time line markers with their index, their position in ms and their label. Changes nothing. */
+    private static string ListMarkers()
+    {
+        var sb = new StringBuilder();
+        sb.Append("{\"ok\": true, \"markers\": [");
+        var markers = vegasRef.Project.Markers;
+        for (int i = 0; i < markers.Count; i++)
+        {
+            if (i > 0) sb.Append(", ");
+            sb.Append("{\"index\": " + i
+                + ", \"positionMs\": " + Num(markers[i].Position.ToMilliseconds())
+                + ", \"label\": " + Quote(markers[i].Label) + "}");
+        }
+        sb.Append("]}");
+        return sb.ToString();
+    }
+
+    /** Removes one time line marker, by the index that marker_list reports. Arguments: <index>. */
+    private static string RemoveMarker(string args)
+    {
+        var index = int.Parse(args.Trim(), CultureInfo.InvariantCulture);
+        var markers = vegasRef.Project.Markers;
+        if (index < 0 || index >= markers.Count)
+        {
+            return Error("no marker at index " + index);
+        }
+        using (new UndoBlock(vegasRef.Project, "vegas-mcp marker"))
+        {
+            markers.RemoveAt(index);
+        }
+        return "{\"ok\": true, \"count\": " + markers.Count + "}";
     }
 
     private static string Vertex(double x, double y)
